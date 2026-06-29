@@ -1,0 +1,5 @@
+dist/
+output/
+build/
+__pycache__/
+*.cpfont

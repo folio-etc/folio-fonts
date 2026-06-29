@@ -1,0 +1,105 @@
+name: Build & Publish SD Card Fonts
+
+# Builds every family in sd-fonts.yaml into .cpfont files + a fonts.json
+# manifest and publishes them as GitHub Release assets. Run manually when the
+# catalog or the conversion pipeline changes.
+#
+# The build engine (build-sd-fonts.py, fontconvert_sdcard.py,
+# generate-font-manifest.py) lives in the firmware repo, so we check it out
+# rather than vendor/duplicate it here. That repo is public, so the default
+# GITHUB_TOKEN can read it — no PAT needed. Publishing targets this same repo,
+# so contents:write below covers the release step.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ENGINE_REPO: folio-etc/folio
+  FONTS_REPO: folio-etc/folio-fonts
+
+jobs:
+  build-fonts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout font catalog
+        uses: actions/checkout@v6
+
+      - name: Checkout build engine (firmware repo)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          path: engine
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfreetype6-dev
+          pip install freetype-py fonttools pyyaml
+
+      - name: Read version constants
+        id: versions
+        run: |
+          echo "binary=$(python3 -c 'import sys; sys.path.insert(0,"engine/lib/EpdFont/scripts"); from cpfont_version import CPFONT_VERSION; print(CPFONT_VERSION)')" >> "$GITHUB_OUTPUT"
+          echo "metadata=$(python3 -c 'import sys; sys.path.insert(0,"engine/lib/EpdFont/scripts"); from cpfont_version import FONTS_MANIFEST_VERSION; print(FONTS_MANIFEST_VERSION)')" >> "$GITHUB_OUTPUT"
+
+      - name: Build SD card fonts
+        run: |
+          python3 engine/lib/EpdFont/scripts/build-sd-fonts.py \
+            --config sd-fonts.yaml --clean --verbose -j 1 --output-dir output
+
+      - name: Flatten output for release assets
+        run: |
+          mkdir -p dist
+          find output -name '*.cpfont' -exec cp {} dist/ \;
+
+      - name: Compute release tags
+        id: tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE="sd-fonts-m${{ steps.versions.outputs.metadata }}-b${{ steps.versions.outputs.binary }}"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+          LAST=$(gh release list --repo "${{ env.FONTS_REPO }}" \
+            --json tagName --jq \
+            '[.[] | select(.tagName | startswith("'"${BASE}-r"'")) | .tagName | split("-r")[1] | tonumber] | max // 0')
+          NEXT=$((LAST + 1))
+          echo "versioned=${BASE}-r${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "revision=$NEXT" >> "$GITHUB_OUTPUT"
+
+      - name: Generate manifest
+        run: |
+          python3 engine/scripts/generate-font-manifest.py \
+            --input dist \
+            --base-url "https://github.com/${{ env.FONTS_REPO }}/releases/download/${{ steps.tags.outputs.base }}/" \
+            --output dist/fonts.json \
+            --descriptions-from sd-fonts.yaml
+
+      - name: Publish versioned release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSIONED="${{ steps.tags.outputs.versioned }}"
+          gh release create "$VERSIONED" dist/* \
+            --repo "${{ env.FONTS_REPO }}" \
+            --title "SD Card Fonts (${VERSIONED#sd-fonts-})" \
+            --notes "Pre-built \`.cpfont\` font files for Folio Reader. Use **Settings > System > Manage Fonts** on the device."
+
+      - name: Update stable tag for device downloads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE="${{ steps.tags.outputs.base }}"
+          gh release delete "$BASE" --repo "${{ env.FONTS_REPO }}" --yes 2>/dev/null || true
+          gh release create "$BASE" dist/* \
+            --repo "${{ env.FONTS_REPO }}" \
+            --title "SD Card Fonts (${BASE#sd-fonts-})" \
+            --notes "Current font build for manifest v${{ steps.versions.outputs.metadata }}, binary format v${{ steps.versions.outputs.binary }}. Devices download from this stable tag.
+
+          Revision **${{ steps.tags.outputs.revision }}** — immutable copy at [\`${{ steps.tags.outputs.versioned }}\`](https://github.com/${{ env.FONTS_REPO }}/releases/tag/${{ steps.tags.outputs.versioned }})."
